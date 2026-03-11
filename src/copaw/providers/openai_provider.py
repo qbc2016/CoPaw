@@ -134,5 +134,6 @@ class OpenAIProvider(Provider):
             model_name=model_id,
             stream=True,
             api_key=self.api_key,
+            stream_tool_parsing=False,
             client_kwargs=client_kwargs,
         )
