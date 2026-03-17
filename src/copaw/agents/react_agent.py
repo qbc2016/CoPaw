@@ -570,7 +570,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
 
     async def _reasoning(
         self,
-        tool_choice: (Literal["auto", "none", "required"] | None) = None,
+        tool_choice: Literal["auto", "none", "required"] | None = None,
     ) -> Msg:
         """Override reasoning with media-block fallback.
 
