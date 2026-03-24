@@ -635,24 +635,31 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
         after a page refresh.  Intermediate events that become empty
         after filtering are silently skipped to avoid blank UI flashes.
         """
-        if getattr(self, "_in_summarizing", False) and isinstance(
-            msg.content,
-            list,
-        ):
+        if getattr(self, "_in_summarizing", False):
             original = msg.content
-            filtered = [
-                b
-                for b in original
-                if not (isinstance(b, dict) and b.get("type") == "tool_use")
-            ]
-            if len(filtered) != len(original):
-                if not filtered and not last:
-                    return
+            if isinstance(original, list):
+                filtered = [
+                    b
+                    for b in original
+                    if not (
+                        isinstance(b, dict) and b.get("type") == "tool_use"
+                    )
+                ]
+                if len(filtered) != len(original):
+                    if not filtered and not last:
+                        return
+                    msg.content = filtered
                 if last:
-                    filtered.append(
+                    msg.content.append(
                         {"type": "text", "text": self._ROUND_END_NOTICE},
                     )
-                msg.content = filtered
+                if msg.content is not original:
+                    try:
+                        return await super().print(msg, last, speech=speech)
+                    finally:
+                        msg.content = original
+            elif isinstance(original, str) and last:
+                msg.content = original + self._ROUND_END_NOTICE
                 try:
                     return await super().print(msg, last, speech=speech)
                 finally:
@@ -675,7 +682,8 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
         strip them and append a bilingual notice telling the user this
         round of calls has ended.
         """
-        if not isinstance(msg.content, list):
+        if isinstance(msg.content, str):
+            msg.content += CoPawAgent._ROUND_END_NOTICE
             return msg
 
         filtered = [
@@ -686,14 +694,12 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
             )
         ]
 
-        if len(filtered) == len(msg.content):
-            return msg
-
         n_removed = len(msg.content) - len(filtered)
-        logger.debug(
-            "Stripped %d tool_use block(s) from _summarizing response",
-            n_removed,
-        )
+        if n_removed:
+            logger.debug(
+                "Stripped %d tool_use block(s) from _summarizing response",
+                n_removed,
+            )
 
         filtered.append({"type": "text", "text": CoPawAgent._ROUND_END_NOTICE})
         msg.content = filtered
