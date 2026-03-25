@@ -293,11 +293,7 @@ class RetryChatModel(ChatModelBase):
                     limiter.release()
 
         # Should be unreachable, but satisfies the type-checker.
-        if last_exc is not None:
-            raise last_exc
-        raise RuntimeError(
-            "Unexpected: no exception captured after all retries",
-        )
+        raise last_exc  # type: ignore[misc]
 
     # pylint: disable=too-many-branches
     async def _wrap_stream(
