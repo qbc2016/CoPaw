@@ -95,9 +95,9 @@ export default function ToolsPage() {
 
               <p className={styles.toolDescription}>{tool.description}</p>
 
-              {tool.name === "execute_shell_command" && (
-                <div className={styles.toolSettings}>
-                  <div className={styles.settingItem}>
+              <div className={styles.cardFooter}>
+                {tool.name === "execute_shell_command" && (
+                  <div className={styles.inlineSettingItem}>
                     <span className={styles.settingLabel}>
                       {t("tools.asyncExecution")}
                     </span>
@@ -108,10 +108,7 @@ export default function ToolsPage() {
                       size="small"
                     />
                   </div>
-                </div>
-              )}
-
-              <div className={styles.cardFooter}>
+                )}
                 <Switch
                   checked={tool.enabled}
                   onChange={() => handleToggle(tool)}
