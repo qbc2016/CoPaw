@@ -95,19 +95,21 @@ export default function ToolsPage() {
 
               <p className={styles.toolDescription}>{tool.description}</p>
 
-              <div className={styles.toolSettings}>
-                <div className={styles.settingItem}>
-                  <span className={styles.settingLabel}>
-                    {t("tools.asyncExecution")}
-                  </span>
-                  <Switch
-                    checked={tool.async_execution}
-                    onChange={() => toggleAsyncExecution(tool)}
-                    disabled={!tool.enabled}
-                    size="small"
-                  />
+              {tool.name === "execute_shell_command" && (
+                <div className={styles.toolSettings}>
+                  <div className={styles.settingItem}>
+                    <span className={styles.settingLabel}>
+                      {t("tools.asyncExecution")}
+                    </span>
+                    <Switch
+                      checked={tool.async_execution}
+                      onChange={() => toggleAsyncExecution(tool)}
+                      disabled={!tool.enabled}
+                      size="small"
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className={styles.cardFooter}>
                 <Switch

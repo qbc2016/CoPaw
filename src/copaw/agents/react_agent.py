@@ -206,9 +206,13 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
                 enabled_tools = {
                     name: tool.enabled for name, tool in builtin_tools.items()
                 }
+                # Only execute_shell_command supports async_execution
                 async_execution_tools = {
-                    name: tool.async_execution
-                    for name, tool in builtin_tools.items()
+                    "execute_shell_command": builtin_tools.get(
+                        "execute_shell_command",
+                    ).async_execution
+                    if "execute_shell_command" in builtin_tools
+                    else False,
                 }
         except Exception as e:
             logger.warning(
