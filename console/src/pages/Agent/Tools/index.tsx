@@ -7,8 +7,15 @@ import styles from "./index.module.less";
 
 export default function ToolsPage() {
   const { t } = useTranslation();
-  const { tools, loading, batchLoading, toggleEnabled, enableAll, disableAll } =
-    useTools();
+  const {
+    tools,
+    loading,
+    batchLoading,
+    toggleEnabled,
+    toggleAsyncExecution,
+    enableAll,
+    disableAll,
+  } = useTools();
   const [hoverKey, setHoverKey] = useState<string | null>(null);
 
   const handleToggle = (tool: ToolInfo) => {
@@ -87,6 +94,20 @@ export default function ToolsPage() {
               </div>
 
               <p className={styles.toolDescription}>{tool.description}</p>
+
+              <div className={styles.toolSettings}>
+                <div className={styles.settingItem}>
+                  <span className={styles.settingLabel}>
+                    {t("tools.asyncExecution")}
+                  </span>
+                  <Switch
+                    checked={tool.async_execution}
+                    onChange={() => toggleAsyncExecution(tool)}
+                    disabled={!tool.enabled}
+                    size="small"
+                  />
+                </div>
+              </div>
 
               <div className={styles.cardFooter}>
                 <Switch

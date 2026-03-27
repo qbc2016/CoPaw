@@ -94,6 +94,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
         request_context: Optional[dict[str, str]] = None,
         namesake_strategy: NamesakeStrategy = "skip",
         workspace_dir: Path | None = None,
+        task_tracker: Any | None = None,
     ):
         """Initialize CoPawAgent.
 
@@ -121,6 +122,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
         self._mcp_clients = mcp_clients or []
         self._namesake_strategy = namesake_strategy
         self._workspace_dir = workspace_dir
+        self._task_tracker = task_tracker
 
         # Extract configuration from agent_config
         running_config = agent_config.running
@@ -194,6 +196,7 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
 
         # Check which tools are enabled from agent config
         enabled_tools = {}
+        async_execution_tools = {}
         try:
             if hasattr(self._agent_config, "tools") and hasattr(
                 self._agent_config.tools,
@@ -202,6 +205,10 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
                 builtin_tools = self._agent_config.tools.builtin_tools
                 enabled_tools = {
                     name: tool.enabled for name, tool in builtin_tools.items()
+                }
+                async_execution_tools = {
+                    name: tool.async_execution
+                    for name, tool in builtin_tools.items()
                 }
         except Exception as e:
             logger.warning(
@@ -241,11 +248,50 @@ class CoPawAgent(ToolGuardMixin, ReActAgent):
                 )
                 continue
 
+            # Get async_execution setting (default to False for backward
+            # compatibility)
+            async_exec = async_execution_tools.get(tool_name, False)
+
             toolkit.register_tool_function(
                 tool_func,
                 namesake_strategy=namesake_strategy,
+                async_execution=async_exec,
             )
-            logger.debug("Registered tool: %s", tool_name)
+            logger.debug(
+                "Registered tool: %s (async_execution=%s)",
+                tool_name,
+                async_exec,
+            )
+
+        # Auto-register background task management tools if any *enabled*
+        # tool has async_execution set
+        has_async_tools = any(
+            async_execution_tools.get(name, False)
+            for name in tool_functions
+            if enabled_tools.get(name, True)
+        )
+        if has_async_tools:
+            try:
+                toolkit.register_tool_function(
+                    toolkit.view_task,
+                    namesake_strategy=namesake_strategy,
+                )
+                toolkit.register_tool_function(
+                    toolkit.wait_task,
+                    namesake_strategy=namesake_strategy,
+                )
+                toolkit.register_tool_function(
+                    toolkit.cancel_task,
+                    namesake_strategy=namesake_strategy,
+                )
+                logger.debug(
+                    "Registered background task management tools "
+                    "(view_task, wait_task, cancel_task)",
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to register task management tools: {e}",
+                )
 
         return toolkit
 
