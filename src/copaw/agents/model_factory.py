@@ -89,7 +89,7 @@ def _format_anthropic_image_block(image_block: dict) -> dict:
         return {**image_block}
 
     url = source["url"]
-    raw_url = url.removeprefix("file://")
+    raw_url = _file_url_to_path(url)
 
     if os.path.exists(raw_url) and os.path.isfile(raw_url):
         ext = os.path.splitext(raw_url)[1].lower()
