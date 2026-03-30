@@ -34,7 +34,6 @@ copaw init --force      # 覆盖已有配置文件
 
 ```bash
 copaw app                             # 默认 127.0.0.1:8088
-copaw app --host 0.0.0.0 --port 9090  # 自定义地址
 copaw app --reload                    # 代码改动自动重载（开发用）
 copaw app --log-level debug           # 详细日志
 ```

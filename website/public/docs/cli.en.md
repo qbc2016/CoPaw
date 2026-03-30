@@ -38,7 +38,6 @@ UI — depends on this.
 
 ```bash
 copaw app                             # Start on 127.0.0.1:8088
-copaw app --host 0.0.0.0 --port 9090  # Custom address
 copaw app --reload                    # Auto-reload on code change (dev)
 copaw app --log-level debug           # Verbose logging
 ```
