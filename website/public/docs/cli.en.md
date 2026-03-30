@@ -27,7 +27,7 @@ copaw init --force      # Overwrite existing config files
 
 1. **Default Workspace Initialization** — automatically create default workspace and configuration files
 2. **LLM provider** — select provider, enter API key, choose model
-(**required**).
+   (**required**).
 3. **Environment variables** — optionally add key-value pairs for tools.
 4. **HEARTBEAT.md** — edit the heartbeat checklist in your default editor.
 
