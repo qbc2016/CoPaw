@@ -157,13 +157,12 @@ def _parse_xml_tool_call(raw_text: str) -> ParsedToolCall | None:
         body = func_match.group(2)
         arguments: dict = {}
         for param_match in _XML_PARAM_RE.finditer(body):
-            param_name = param_match.group(1).strip()
-            param_value = param_match.group(2).strip()
-            arguments[param_name] = param_value
-        if not arguments:
-            # </function> present but </parameter> absent — fall through
-            # to lenient parameter parsing on the same body.
-            arguments = _extract_params_lenient(body)
+            arguments[param_match.group(1).strip()] = param_match.group(
+                2,
+            ).strip()
+        lenient_args = _extract_params_lenient(body)
+        if len(lenient_args) > len(arguments):
+            arguments = lenient_args
         if not arguments and "<parameter=" in body:
             # Body contains <parameter= tags but neither strict nor lenient
             # parsing could extract them — treat as a parse failure.
