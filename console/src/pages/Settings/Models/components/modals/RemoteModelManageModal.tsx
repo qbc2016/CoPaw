@@ -175,11 +175,13 @@ function ModelConfigEditor({
   providerId,
   model,
   onSaved,
+  onClose,
   isDark,
 }: {
   providerId: string;
   model: ModelInfo;
   onSaved: () => void | Promise<void>;
+  onClose: () => void;
   isDark: boolean;
 }) {
   const { t } = useTranslation();
@@ -235,6 +237,7 @@ function ModelConfigEditor({
       message.success(t("models.modelConfigSaved", { name: model.name }));
       setDirty(false);
       await onSaved();
+      onClose();
     } catch (error) {
       const errMsg =
         error instanceof Error
@@ -528,8 +531,6 @@ export function RemoteModelManageModal({
           all_models.map((m) => {
             const isDeletable = extraModelIds.has(m.id);
             const isConfigOpen = configOpenModelId === m.id;
-            const hasModelConfig =
-              m.generate_kwargs && Object.keys(m.generate_kwargs).length > 0;
             return (
               <div key={m.id}>
                 <div className={styles.modelListItem}>
@@ -563,14 +564,6 @@ export function RemoteModelManageModal({
                           style={{ fontSize: 11, marginLeft: 6 }}
                         >
                           {t("models.tagNotProbed", "未检测")}
-                        </Tag>
-                      )}
-                      {hasModelConfig && (
-                        <Tag
-                          color="orange"
-                          style={{ fontSize: 11, marginLeft: 4 }}
-                        >
-                          {t("models.modelAdvancedConfig")}
                         </Tag>
                       )}
                     </span>
@@ -717,6 +710,7 @@ export function RemoteModelManageModal({
                       providerId={provider.id}
                       model={m}
                       onSaved={onSaved}
+                      onClose={() => setConfigOpenModelId(null)}
                       isDark={isDark}
                     />
                   </div>

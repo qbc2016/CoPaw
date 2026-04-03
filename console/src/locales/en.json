@@ -659,7 +659,7 @@
     "modelAdvancedConfig": "Model Advanced Config",
     "modelGenerateConfig": "Model Generation Parameters",
     "modelGenerateConfigHint": "Generation parameters expressed as a JSON object for this model. They will be expanded and passed into the generation request. These override provider-level advanced configuration.",
-    "modelConfigSaved": "Configuration saved for model {name}",
+    "modelConfigSaved": "Configuration saved for model {{name}}",
     "modelConfigSaveFailed": "Failed to save model configuration",
     "protocol": "Protocol",
     "protocolHint": "Choose the provider API protocol for this configuration.",
