@@ -529,8 +529,7 @@ export function RemoteModelManageModal({
             const isDeletable = extraModelIds.has(m.id);
             const isConfigOpen = configOpenModelId === m.id;
             const hasModelConfig =
-              m.generate_kwargs &&
-              Object.keys(m.generate_kwargs).length > 0;
+              m.generate_kwargs && Object.keys(m.generate_kwargs).length > 0;
             return (
               <div key={m.id}>
                 <div className={styles.modelListItem}>
