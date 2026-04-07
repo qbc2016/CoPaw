@@ -17,6 +17,7 @@ import base64
 import logging
 import os
 import secrets
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -39,6 +40,7 @@ def _get_secret_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 _cached_master_key: Optional[bytes] = None
+_master_key_lock = threading.Lock()
 
 
 def _should_skip_keyring() -> bool:
@@ -108,8 +110,22 @@ def _read_key_file() -> Optional[str]:
     path = _master_key_file()
     if path.is_file():
         try:
-            return path.read_text(encoding="utf-8").strip()
-        except OSError:
+            content = path.read_text(encoding="utf-8").strip()
+            if not content:
+                return None
+            bytes.fromhex(content)
+            if len(content) != 64:
+                logger.warning(
+                    "Master key file has unexpected length (%d hex chars,"
+                    " expected 64); ignoring",
+                    len(content),
+                )
+                return None
+            return content
+        except (OSError, ValueError):
+            logger.warning(
+                "Master key file is corrupt or unreadable; will regenerate",
+            )
             return None
     return None
 
@@ -132,8 +148,12 @@ def _generate_master_key() -> str:
 def _get_master_key() -> bytes:
     """Return the 32-byte master key, creating one if it does not exist.
 
+    Uses double-checked locking to guarantee that only one thread ever
+    generates or loads the key, even when multiple FastAPI worker
+    threads start up concurrently.
+
     Resolution order:
-    1. In-process cache
+    1. In-process cache (fast path, no lock)
     2. OS keychain (via ``keyring``)
     3. File ``SECRET_DIR/.master_key``
     4. Generate new → store in keychain (preferred) and file (fallback)
@@ -142,23 +162,24 @@ def _get_master_key() -> bytes:
     if _cached_master_key is not None:
         return _cached_master_key
 
-    key_hex = _try_keyring_get()
+    with _master_key_lock:
+        if _cached_master_key is not None:
+            return _cached_master_key
 
-    # Try file
-    if not key_hex:
-        key_hex = _read_key_file()
-        if key_hex:
-            # Backfill into keychain for next time
+        key_hex = _try_keyring_get()
+
+        if not key_hex:
+            key_hex = _read_key_file()
+            if key_hex:
+                _try_keyring_set(key_hex)
+
+        if not key_hex:
+            key_hex = _generate_master_key()
             _try_keyring_set(key_hex)
+            _write_key_file(key_hex)
 
-    # Generate new key
-    if not key_hex:
-        key_hex = _generate_master_key()
-        _try_keyring_set(key_hex)
-        _write_key_file(key_hex)
-
-    _cached_master_key = bytes.fromhex(key_hex)
-    return _cached_master_key
+        _cached_master_key = bytes.fromhex(key_hex)
+        return _cached_master_key
 
 
 # ---------------------------------------------------------------------------
@@ -166,14 +187,21 @@ def _get_master_key() -> bytes:
 # ---------------------------------------------------------------------------
 
 
+_cached_fernet: Optional[object] = None
+
+
 def _get_fernet():
-    """Build a Fernet instance from the master key."""
+    """Return a cached Fernet instance backed by the master key."""
+    global _cached_fernet
+    if _cached_fernet is not None:
+        return _cached_fernet
+
     from cryptography.fernet import Fernet
 
     raw = _get_master_key()
-    # Fernet requires a 32-byte url-safe-base64-encoded key
     fernet_key = base64.urlsafe_b64encode(raw[:32])
-    return Fernet(fernet_key)
+    _cached_fernet = Fernet(fernet_key)
+    return _cached_fernet
 
 
 def encrypt(plaintext: str) -> str:

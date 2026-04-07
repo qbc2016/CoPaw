@@ -29,6 +29,7 @@ def _isolate_master_key(tmp_path: Path, monkeypatch):
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     )
     monkeypatch.setattr(mod, "_cached_master_key", test_key)
+    monkeypatch.setattr(mod, "_cached_fernet", None)
     monkeypatch.setattr(mod, "_get_secret_dir", lambda: tmp_path)
 
 
@@ -125,6 +126,7 @@ class TestDecryptFailureGraceful:
 
         new_key = bytes.fromhex("bb" * 32)
         monkeypatch.setattr(mod, "_cached_master_key", new_key)
+        monkeypatch.setattr(mod, "_cached_fernet", None)
 
         result = decrypt(ct)
         assert result == ct
