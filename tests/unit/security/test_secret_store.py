@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pylint: disable=redefined-outer-name
+# pylint: disable=protected-access
 """Tests for the encrypted secret store layer."""
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 
 from copaw.security.secret_store import (
-    _ENC_PREFIX,
     AUTH_SECRET_FIELDS,
     PROVIDER_SECRET_FIELDS,
     decrypt,
@@ -37,7 +36,7 @@ class TestEncryptDecrypt:
     def test_roundtrip(self):
         plaintext = "sk-test-key-1234"
         ct = encrypt(plaintext)
-        assert ct.startswith(_ENC_PREFIX)
+        assert is_encrypted(ct)
         assert decrypt(ct) == plaintext
 
     def test_empty_passthrough(self):
@@ -149,7 +148,7 @@ class TestMasterKeyGeneration:
             "_try_keyring_get",
             return_value=None,
         ), patch.object(mod, "_try_keyring_set", return_value=False):
-            key = mod.get_master_key()
+            key = mod._get_master_key()
 
         assert isinstance(key, bytes)
         assert len(key) == 32
@@ -169,6 +168,6 @@ class TestMasterKeyGeneration:
             "_try_keyring_get",
             return_value=None,
         ), patch.object(mod, "_try_keyring_set", return_value=False):
-            key = mod.get_master_key()
+            key = mod._get_master_key()
 
         assert key == bytes.fromhex(key_hex)

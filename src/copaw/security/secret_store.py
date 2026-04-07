@@ -129,7 +129,7 @@ def _generate_master_key() -> str:
     return secrets.token_hex(32)
 
 
-def get_master_key() -> bytes:
+def _get_master_key() -> bytes:
     """Return the 32-byte master key, creating one if it does not exist.
 
     Resolution order:
@@ -170,7 +170,7 @@ def _get_fernet():
     """Build a Fernet instance from the master key."""
     from cryptography.fernet import Fernet
 
-    raw = get_master_key()
+    raw = _get_master_key()
     # Fernet requires a 32-byte url-safe-base64-encoded key
     fernet_key = base64.urlsafe_b64encode(raw[:32])
     return Fernet(fernet_key)
@@ -252,11 +252,5 @@ def decrypt_dict_fields(
             and isinstance(result[field], str)
             and result[field]
         ):
-            try:
-                result[field] = decrypt(result[field])
-            except Exception:
-                logger.warning(
-                    "Failed to decrypt field '%s'; treating as plaintext",
-                    field,
-                )
+            result[field] = decrypt(result[field])
     return result
