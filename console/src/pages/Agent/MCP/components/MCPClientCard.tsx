@@ -171,7 +171,8 @@ export function MCPClientCard({
             className={styles.toolsButton}
             onClick={handleShowTools}
             icon={<ToolOutlined />}
-            disabled={!client.enabled}
+            disabled={!client.enabled || toolsLoading}
+            loading={toolsLoading}
           >
             {t("mcp.tools")}
           </Button>
