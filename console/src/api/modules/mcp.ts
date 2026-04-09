@@ -56,7 +56,5 @@ export const mcpApi = {
    * List tools from a connected MCP server
    */
   listMCPTools: (clientKey: string) =>
-    request<MCPToolInfo[]>(
-      `/mcp/${encodeURIComponent(clientKey)}/tools`,
-    ),
+    request<MCPToolInfo[]>(`/mcp/${encodeURIComponent(clientKey)}/tools`),
 };
