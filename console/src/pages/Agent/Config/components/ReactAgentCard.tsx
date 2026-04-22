@@ -60,15 +60,17 @@ export function ReactAgentCard({
 
   const handlePlanToggle = useCallback(async (checked: boolean) => {
     setPlanLoading(true);
+    const prev = planEnabled;
+    setPlanEnabled(checked);
     try {
       const res = await planApi.updatePlanConfig({ enabled: checked });
       setPlanEnabled(res.enabled);
     } catch {
-      // revert on failure
+      setPlanEnabled(prev);
     } finally {
       setPlanLoading(false);
     }
-  }, []);
+  }, [planEnabled]);
 
   return (
     <Card className={styles.formCard} title={t("agentConfig.reactAgentTitle")}>
