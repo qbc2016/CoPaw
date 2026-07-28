@@ -10,7 +10,6 @@ export interface PawAppInfo {
   category: string;
   icon: string;
   status: string;
-  home_page: string | null;
   entry_page?: string;
   launch_scope?: string;
   dir: string;
@@ -22,12 +21,6 @@ export interface PawAppInfo {
 export interface PawAppListResponse {
   apps: PawAppInfo[];
   total: number;
-}
-
-export interface PawAppIframeResponse {
-  app_id: string;
-  iframe_url: string | null;
-  error?: string;
 }
 
 export const pawappApi = {
@@ -51,20 +44,6 @@ export const pawappApi = {
     });
     if (!res.ok)
       throw new Error(`Failed to get PawApp ${appId}: ${res.statusText}`);
-    return res.json();
-  },
-
-  /**
-   * Get the iframe URL for a PawApp.
-   */
-  async getIframeUrl(appId: string): Promise<PawAppIframeResponse> {
-    const res = await fetch(getApiUrl(`/pawapps/${appId}/iframe`), {
-      headers: buildAuthHeaders(),
-    });
-    if (!res.ok)
-      throw new Error(
-        `Failed to get iframe URL for ${appId}: ${res.statusText}`,
-      );
     return res.json();
   },
 
