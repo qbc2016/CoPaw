@@ -156,7 +156,7 @@
       return apiFetch("/agent-kanban/issues/" + id + "/stop", { method: "POST" });
     },
     listAgents: function () {
-      return apiFetch("/agents");
+      return apiFetch("/agent-kanban/agents");
     },
     listApprovals: function () {
       return apiFetch("/agent-kanban/approvals");

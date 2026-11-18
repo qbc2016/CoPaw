@@ -4,10 +4,10 @@
 
 A Kanban board where issues are created, assigned to agents, and
 auto-run through the assigned agent via ``ctx.chat``. Agents can query
-their own assigned issues through the ``list_my_kanban_issues`` tool.
+their assigned issues through the app routes.
 
-Persistence: a shared JSON file (``<app_dir>/data/issues.json``) so both
-the HTTP API and the agent tool read/write the exact same data.
+Persistence: a shared JSON board under the host-owned plugin data root.
+Existing plugin-local board data is copied without deleting the source.
 """
 
 import asyncio
@@ -19,6 +19,8 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from collections.abc import Mapping
+from contextlib import aclosing
 
 try:  # POSIX advisory file locking (macOS/Linux) for cross-process safety.
     import fcntl
@@ -26,12 +28,18 @@ except ImportError:  # pragma: no cover - Windows fallback (single-process).
     fcntl = None
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import HTTPException
 from pydantic import BaseModel
 
-from qwenpaw.pawapp import PawApp, get_ctx
-from qwenpaw.pawapp.task import SSEChannel
+from qwenpaw.plugins.apps import ChatRequest, PawApp, StreamingResponse
+from qwenpaw.plugins.events import ChatEvent
+
+# The host loads the entry as an isolated package.
+# pylint: disable=relative-beyond-top-level
+from .stream import SSEChannel
+from .routes import register_routes
+
+# pylint: enable=relative-beyond-top-level
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +78,26 @@ STATUS_LABEL = {
     "review": "审核中",
     "done": "已完成",
 }
+
+
+async def _blocking(function, *args):
+    """Retain the lock/file owner until a blocking operation actually exits."""
+    # This waiter is always joined, including cancellation. ResourceScope
+    # owns the actual thread; cancelling the waiter must not close its file.
+    task = asyncio.create_task(
+        _PLUGIN.resources.run_sync(function, *args),
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        if not task.cancelled():
+            task.exception()
+        raise
 
 
 def _load_from_disk() -> List[Dict[str, Any]]:
@@ -174,7 +202,7 @@ class _Txn:
                 encoding="utf-8",
             )
             # Run blocking flock in thread pool to avoid blocking event loop
-            await asyncio.to_thread(
+            await _blocking(
                 fcntl.flock,
                 self._fh.fileno(),
                 fcntl.LOCK_EX,
@@ -191,11 +219,7 @@ class _Txn:
         try:
             if fcntl is not None and self._fh is not None:
                 # Run blocking flock unlock in thread pool
-                await asyncio.to_thread(
-                    fcntl.flock,
-                    self._fh.fileno(),
-                    fcntl.LOCK_UN,
-                )
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
                 self._fh.close()
                 self._fh = None
         finally:
@@ -289,26 +313,24 @@ def _build_issue_prompt(issue: Dict[str, Any]) -> str:
 
 
 # ── HTTP router ──────────────────────────────────────────────────────
-router = APIRouter()
+_PLUGIN = None
 
 
-@router.get("/issues")
-async def list_issues(ctx=Depends(get_ctx)) -> Dict[str, Any]:
+async def list_issues(ctx=None) -> Dict[str, Any]:
     """List every issue on the board."""
-    issues = await asyncio.to_thread(_read_all)
+    issues = await _blocking(_read_all)
 
     # Cache ctx for agents (needed by background dispatcher)
     for issue in issues:
         if issue.get("assignee"):
-            _LAST_CTX.setdefault(issue["assignee"], ctx)
+            _LAST_CTX.setdefault(issue["id"], ctx)
 
     return {"issues": issues}
 
 
-@router.post("/issues")
 async def create_issue(
     body: IssueCreate,
-    ctx=Depends(get_ctx),
+    ctx=None,
 ) -> Dict[str, Any]:
     """Create a new issue.
 
@@ -349,17 +371,16 @@ async def create_issue(
             trigger_agent = assignee
 
     if trigger_agent:
-        _LAST_CTX.setdefault(trigger_agent, ctx)
+        _LAST_CTX[issue["id"]] = ctx
         # Background dispatcher will pick up this task automatically
 
     return issue
 
 
-@router.patch("/issues/{issue_id:path}")
 async def patch_issue(
     issue_id: str,
     body: IssuePatch,
-    ctx=Depends(get_ctx),
+    ctx=None,
 ) -> Dict[str, Any]:
     """Update an issue's title/description/status/assignee.
 
@@ -438,16 +459,15 @@ async def patch_issue(
         _write_all(issues)
 
     if trigger_agent:
-        _LAST_CTX.setdefault(trigger_agent, ctx)
+        _LAST_CTX[issue["id"]] = ctx
         # Background dispatcher will pick up this task automatically
 
     return issue
 
 
-@router.delete("/issues/{issue_id:path}")
 async def delete_issue(
     issue_id: str,
-    ctx=Depends(get_ctx),
+    ctx=None,
 ) -> Dict[str, Any]:
     """Remove an issue from the board and its session data."""
     issue = None
@@ -459,37 +479,12 @@ async def delete_issue(
         issues = [i for i in issues if i.get("id") != issue_id]
         _write_all(issues)
 
-    # Delete the session file for this issue
-    if issue and issue.get("assignee"):
-        try:
-            # Use the assignee's agent_id to find the correct workspace
-            from dataclasses import replace
-
-            agent_ctx = replace(ctx, agent_id=issue["assignee"])
-            # pylint: disable=protected-access
-            workspace = await agent_ctx._get_workspace()
-            if workspace and hasattr(workspace, "session"):
-                session_mgr = workspace.session
-                # pylint: disable=protected-access
-                session_path = session_mgr._get_save_path(
-                    session_id=issue_id,
-                    user_id=agent_ctx.user_id,
-                    channel=agent_ctx.channel,
-                )
-                try:
-                    os.remove(session_path)
-                    logger.info(
-                        "[kanban] Deleted session file for issue %s",
-                        issue_id,
-                    )
-                except FileNotFoundError:
-                    pass  # Already deleted or never existed
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "[kanban] Failed to delete session for issue %s",
-                issue_id,
-                exc_info=True,
-            )
+    if issue and issue.get("assignee") and issue.get("sdk_session"):
+        async with ctx.for_workspace(issue["assignee"]) as call:
+            for session in await call.sessions():
+                if session.session_id.endswith(":" + issue_id):
+                    await call.delete_session(session.id)
+    _LAST_CTX.pop(issue_id, None)
 
     return {"ok": True}
 
@@ -511,11 +506,28 @@ async def _execute_run(
     next queued issue for the same *assignee* via
     ``_try_dispatch_next``.
     """
-    # Shallow-copy ctx so we don't mutate the cached _LAST_CTX
-    # instance, and set agent_id to the assignee so the correct
-    # tool execution policy (approval_level) is applied.
-    if assignee:
-        ctx = dataclasses.replace(ctx, agent_id=assignee)
+    # Enter a fresh call scope while preserving the authenticated caller.
+    try:
+        async with ctx.for_workspace(assignee or ctx.workspace_id) as call:
+            await _execute_owned(call, issue_id, prompt, assignee)
+    except Exception as exc:
+        async with _txn():
+            issue = _find(_read_all(), issue_id)
+            if issue is not None:
+                issue.update(status="backlog", error=str(exc))
+                _write_all(_read_all())
+        channel = _CHANNELS.get(issue_id)
+        if channel is not None:
+            await channel.send_event({"type": "error", "message": str(exc)})
+            channel.close()
+
+
+async def _execute_owned(ctx, issue_id, prompt, assignee):
+    async with _txn():
+        issue = _find(_read_all(), issue_id)
+        if issue is not None:
+            issue["sdk_session"] = True
+            _write_all(_read_all())
 
     error = ""
     _LIVE_TRACE[issue_id] = []
@@ -531,57 +543,73 @@ async def _execute_run(
             assignee,
         )
         # Clear session to avoid context pollution across runs
-        async for ev in ctx.chat_stream(
-            "/clear",
-            session_id=issue_id,
-        ):
-            pass  # Consume clear events
-        async for ev in ctx.chat_stream(
-            prompt,
-            session_id=issue_id,
-        ):
-            logger.debug(
-                "[kanban] ev type=%s delta=%s",
-                getattr(ev, "type", "?"),
-                getattr(ev, "delta", "?"),
-            )
-            # Skip delta=True events
-            # (no live streaming, only show complete messages)
-            if getattr(ev, "delta", False):
-                continue
+        await ctx.chat(ChatRequest("/clear", session_id=issue_id))
+        async with aclosing(
+            ctx.chat_stream(
+                ChatRequest(prompt, session_id=issue_id),
+            ),
+        ) as stream:
+            async for ev in stream:
+                logger.debug(
+                    "[kanban] ev type=%s delta=%s",
+                    getattr(ev, "type", "?"),
+                    getattr(ev, "delta", "?"),
+                )
+                # Skip delta=True events
+                # (no live streaming, only show complete messages)
+                if ev.attributes.get("delta", False):
+                    continue
 
-            # Store complete event (delta=False) to in-memory trace
-            try:
-                if hasattr(ev, "model_dump"):
-                    ev_dict = ev.model_dump()
-                elif hasattr(ev, "dict"):
-                    ev_dict = ev.dict()
-                elif dataclasses.is_dataclass(ev):
-                    ev_dict = dataclasses.asdict(ev)
-                else:
-                    ev_dict = {"raw": str(ev)}
-                trace.append(ev_dict)
-            except Exception:  # noqa: BLE001
-                pass
+                trace.append(ev.to_dict())
 
-            # Send SSE notifications
-            raw_type = getattr(ev, "type", None)
-            if hasattr(raw_type, "value"):
-                raw_type = raw_type.value
-            msg_type = str(raw_type) if raw_type else ""
+                # Send SSE notifications
+                raw_type = getattr(ev, "type", None)
+                if hasattr(raw_type, "value"):
+                    raw_type = raw_type.value
+                msg_type = str(raw_type) if raw_type else ""
 
-            # Tool call start
-            if any(
-                k in msg_type
-                for k in ("plugin_call", "function_call", "mcp_tool_call")
-            ):
-                if "_output" not in msg_type:
+                # Tool call start
+                if any(
+                    k in msg_type
+                    for k in ("plugin_call", "function_call", "mcp_tool_call")
+                ):
+                    if "_output" not in msg_type:
+                        name = ""
+                        content = getattr(ev, "content", None)
+                        if isinstance(content, (list, tuple)):
+                            for blk in content:
+                                data = getattr(blk, "data", None)
+                                if isinstance(data, Mapping):
+                                    name = data.get("name", "")
+                                elif data:
+                                    name = getattr(data, "name", "")
+                                if name:
+                                    break
+                        if not name:
+                            name = getattr(ev, "name", "")
+                        # Skip internal tools like "assistant"
+                        if name and name != "assistant":
+                            ch = _ch()
+                            if ch is not None:
+                                await ch.send_event(
+                                    {"type": "tool_start", "name": name},
+                                )
+
+                # Tool call completion
+                elif any(
+                    k in msg_type
+                    for k in (
+                        "plugin_call_output",
+                        "function_call_output",
+                        "mcp_tool_call_output",
+                    )
+                ):
                     name = ""
                     content = getattr(ev, "content", None)
-                    if isinstance(content, list):
+                    if isinstance(content, (list, tuple)):
                         for blk in content:
                             data = getattr(blk, "data", None)
-                            if isinstance(data, dict):
+                            if isinstance(data, Mapping):
                                 name = data.get("name", "")
                             elif data:
                                 name = getattr(data, "name", "")
@@ -589,46 +617,16 @@ async def _execute_run(
                                 break
                     if not name:
                         name = getattr(ev, "name", "")
-                    # Skip internal tools like "assistant"
+                    # Skip internal tools
                     if name and name != "assistant":
                         ch = _ch()
                         if ch is not None:
                             await ch.send_event(
-                                {"type": "tool_start", "name": name},
+                                {"type": "tool_done", "name": name},
                             )
 
-            # Tool call completion
-            elif any(
-                k in msg_type
-                for k in (
-                    "plugin_call_output",
-                    "function_call_output",
-                    "mcp_tool_call_output",
-                )
-            ):
-                name = ""
-                content = getattr(ev, "content", None)
-                if isinstance(content, list):
-                    for blk in content:
-                        data = getattr(blk, "data", None)
-                        if isinstance(data, dict):
-                            name = data.get("name", "")
-                        elif data:
-                            name = getattr(data, "name", "")
-                        if name:
-                            break
-                if not name:
-                    name = getattr(ev, "name", "")
-                # Skip internal tools
-                if name and name != "assistant":
-                    ch = _ch()
-                    if ch is not None:
-                        await ch.send_event(
-                            {"type": "tool_done", "name": name},
-                        )
-
-            # Text messages (skip for now, only show tool calls)
-            # Final result will be fetched from session via /result API
+                # Text messages (skip for now, only show tool calls)
+                # Final result will be fetched from session via /result API
 
         logger.info(
             "[kanban] stream done for %s: %d trace entries",
@@ -693,8 +691,9 @@ def _launch_run(
     if old is not None and not old.done():
         old.cancel()
 
-    task = asyncio.create_task(
+    task = _PLUGIN.resources.task(
         _execute_run(ctx, issue_id, prompt, assignee),
+        "Kanban issue " + issue_id,
     )
     _RUNNING[issue_id] = task
 
@@ -716,11 +715,10 @@ def _launch_run(
 _LAST_CTX: Dict[str, Any] = {}
 
 
-@router.post("/issues/{issue_id:path}/run")
 async def run_issue(
     issue_id: str,
     language: Optional[str] = None,
-    ctx=Depends(get_ctx),
+    ctx=None,
 ) -> Dict[str, Any]:
     """Dispatch the issue to its assigned agent (non-blocking).
 
@@ -751,7 +749,7 @@ async def run_issue(
             issue["status"] = "todo"
             issue["updated_at"] = _now()
             _write_all(issues)
-            _LAST_CTX.setdefault(assignee, ctx)
+            _LAST_CTX[issue_id] = ctx
             return issue
 
         issue["status"] = "in_progress"
@@ -761,12 +759,11 @@ async def run_issue(
         _write_all(issues)
         prompt = _build_issue_prompt(issue)
 
-    _LAST_CTX[assignee] = ctx
+    _LAST_CTX[issue_id] = ctx
     _launch_run(ctx, issue_id, prompt, assignee)
     return issue
 
 
-@router.get("/issues/{issue_id:path}/stream")
 async def stream_issue(issue_id: str) -> StreamingResponse:
     """SSE stream of the agent's realtime output for an issue.
 
@@ -800,7 +797,7 @@ async def stream_issue(issue_id: str) -> StreamingResponse:
             elif msg_type == "plugin_call":
                 if content and isinstance(content[0], dict):
                     data = content[0].get("data", {})
-                    if isinstance(data, dict):
+                    if isinstance(data, Mapping):
                         name = data.get("name", "")
                         if name and name != "assistant":
                             replay.append(
@@ -811,7 +808,7 @@ async def stream_issue(issue_id: str) -> StreamingResponse:
             elif msg_type == "plugin_call_output":
                 if content and isinstance(content[0], dict):
                     data = content[0].get("data", {})
-                    if isinstance(data, dict):
+                    if isinstance(data, Mapping):
                         name = data.get("name", "")
                         if name and name != "assistant":
                             replay.append(
@@ -840,16 +837,15 @@ async def stream_issue(issue_id: str) -> StreamingResponse:
     )
 
 
-@router.get("/issues/{issue_id:path}/result")
 async def get_issue_result(
     issue_id: str,
-    ctx=Depends(get_ctx),
+    ctx=None,
 ) -> Dict[str, Any]:
     """Get the complete history of an issue from session or trace.
 
     Returns all assistant messages from the session.
     """
-    issues = await asyncio.to_thread(_read_all)
+    issues = await _blocking(_read_all)
     issue = _find(issues, issue_id)
     if issue is None:
         raise HTTPException(status_code=404, detail="Issue not found")
@@ -858,23 +854,27 @@ async def get_issue_result(
     if "error" in issue:
         return {"error": issue["error"]}
 
-    # Try to get from session first
-    # IMPORTANT: Use issue's assignee agent_id to query the correct workspace
-    agent_ctx = ctx
-    if issue.get("assignee"):
-        from dataclasses import replace
-
-        agent_ctx = replace(ctx, agent_id=issue["assignee"])
-
+    if issue.get("legacy_session") and not issue.get("sdk_session"):
+        raise HTTPException(
+            status_code=409,
+            detail="Legacy history needs host migration; rerun explicitly "
+            "to start a new SDK session. Original history is retained.",
+        )
     try:
-        history = await agent_ctx.get_session_history(session_id=issue_id)
-        if history:
-            # Return all assistant messages
-            assistant_messages = [
-                msg for msg in history if msg.get("role") == "assistant"
-            ]
-            if assistant_messages:
-                return {"messages": assistant_messages}
+        async with ctx.for_workspace(
+            issue.get("assignee") or ctx.workspace_id,
+        ) as call:
+            history = await call.history(issue_id)
+            if history:
+                return {
+                    "messages": [
+                        ChatEvent("response", output=(message,)).to_dict()[
+                            "output"
+                        ][0]
+                        for message in history
+                        if message.role == "assistant"
+                    ],
+                }
     except Exception:  # noqa: BLE001
         logger.exception(
             "[kanban] Failed to get session history for %s (assignee=%s)",
@@ -908,7 +908,7 @@ async def get_issue_result(
             )
         ):
             content = ev_dict.get("content", [])
-            if isinstance(content, list) and content:
+            if isinstance(content, (list, tuple)) and content:
                 for item in content:
                     if isinstance(item, dict):
                         data = item.get("data", {})
@@ -948,12 +948,13 @@ async def get_issue_result(
     return {"messages": messages}
 
 
-@router.post("/issues/{issue_id:path}/stop")
 async def stop_issue(issue_id: str) -> Dict[str, Any]:
     """Stop a running issue: cancel its background task and reset status."""
-    task = _RUNNING.pop(issue_id, None)
+    task = _RUNNING.get(issue_id)
     if task is not None and not task.done():
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    _RUNNING.pop(issue_id, None)
     ch = _CHANNELS.pop(issue_id, None)
     if ch is not None:
         ch.close()
@@ -977,118 +978,50 @@ async def stop_issue(issue_id: str) -> Dict[str, Any]:
     return issue
 
 
-@router.get("/approvals")
-async def list_kanban_approvals() -> Dict[str, Any]:
-    """Return pending approvals for all in_progress kanban issues.
-
-    Queries the global ApprovalService for approvals whose
-    ``session_id`` matches ``pawapp:agent-kanban:<issue_id>``.
-    """
-    try:
-        from qwenpaw.app.approvals import get_approval_service
-        from qwenpaw.app.approvals.display import (
-            approval_display_fields,
-        )
-    except ImportError:
-        return {"approvals": {}}
-
-    svc = get_approval_service()
-    issues = await asyncio.to_thread(_read_all)
-    running_ids = {
-        iss["id"] for iss in issues if iss.get("status") == "in_progress"
-    }
-    if not running_ids:
-        return {"approvals": {}}
-
-    # pylint: disable=protected-access
-    result: Dict[str, List[Dict[str, Any]]] = {}
-    async with svc._lock:
-        for p in svc._pending.values():
-            if p.status != "pending":
-                continue
-            sid = p.session_id or ""
-            for iid in running_ids:
-                if sid == iid or sid.endswith(f":{iid}"):
-                    result.setdefault(iid, []).append(
-                        {
-                            "request_id": p.request_id,
-                            "session_id": p.session_id,
-                            "root_session_id": (p.root_session_id),
-                            "tool_name": p.tool_name,
-                            "agent_id": p.agent_id,
-                            "severity": p.severity,
-                            **approval_display_fields(p),
-                            "created_at": p.created_at,
-                        },
-                    )
+async def list_kanban_approvals(ctx=None) -> Dict[str, Any]:
+    """List only approvals visible to the authenticated app caller."""
+    result = {}
+    for issue in list(_read_all()):
+        if issue.get("status") != "in_progress" or not issue.get("assignee"):
+            continue
+        async with ctx.for_workspace(issue["assignee"]) as call:
+            rows = await call.approvals(issue["id"])
+            if rows:
+                result[issue["id"]] = [
+                    {
+                        "request_id": row.request_id,
+                        "session_id": row.session_id,
+                        "root_session_id": row.root_session_id,
+                        "tool_name": row.name,
+                        "agent_id": row.workspace_id,
+                        "severity": row.severity,
+                        "created_at": row.created_at,
+                        **dataclasses.asdict(row.display),
+                    }
+                    for row in rows
+                ]
     return {"approvals": result}
 
 
-@router.post("/approvals/{request_id}/approve")
-async def approve_kanban(request_id: str) -> Dict[str, Any]:
-    """Approve a pending tool execution from the kanban UI.
-
-    Looks up the pending approval by *request_id* and resolves
-    it using its own ``root_session_id``, so the frontend does
-    not need to know the session topology.
-    """
-    try:
-        from qwenpaw.app.approvals import get_approval_service
-        from qwenpaw.security.tool_guard.approval import (
-            ApprovalDecision,
-        )
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=501,
-            detail="Approval service unavailable",
-        ) from exc
-
-    svc = get_approval_service()
-    pending = await svc.get_request(request_id)
-    if pending is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Approval request not found",
-        )
-    await svc.resolve_request(
-        request_id,
-        ApprovalDecision.APPROVED,
-    )
-    return {"ok": True, "tool_name": pending.tool_name}
+async def resolve_kanban(request_id, approved, ctx):
+    """Resolve a visible issue approval without global service access."""
+    for issue in list(_read_all()):
+        if not issue.get("assignee"):
+            continue
+        async with ctx.for_workspace(issue["assignee"]) as call:
+            for row in await call.approvals(issue["id"]):
+                if row.request_id == request_id:
+                    resolved = await call.resolve_approval(
+                        request_id,
+                        approved=approved,
+                    )
+                    return {"ok": resolved, "tool_name": row.name}
+    raise HTTPException(404, "Approval request not found")
 
 
-@router.post("/approvals/{request_id}/deny")
-async def deny_kanban(request_id: str) -> Dict[str, Any]:
-    """Deny a pending tool execution from the kanban UI."""
-    try:
-        from qwenpaw.app.approvals import get_approval_service
-        from qwenpaw.security.tool_guard.approval import (
-            ApprovalDecision,
-        )
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=501,
-            detail="Approval service unavailable",
-        ) from exc
-
-    svc = get_approval_service()
-    pending = await svc.get_request(request_id)
-    if pending is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Approval request not found",
-        )
-    await svc.resolve_request(
-        request_id,
-        ApprovalDecision.DENIED,
-    )
-    return {"ok": True, "tool_name": pending.tool_name}
-
-
-@router.get("/queue/{agent_id:path}")
 async def get_agent_queue(agent_id: str) -> Dict[str, Any]:
     """Return the todo queue and running status for *agent_id*."""
-    issues = await asyncio.to_thread(_read_all)
+    issues = await _blocking(_read_all)
     running = None
     queue: List[Dict[str, Any]] = []
     for iss in issues:
@@ -1115,7 +1048,7 @@ async def get_agent_queue(agent_id: str) -> Dict[str, Any]:
 
 # ── PawApp definition + agent-facing tools ───────────────────────────
 app = PawApp(name="Agent Kanban", app_id="agent-kanban")
-app.include_router(router)
+register_routes(app, globals())
 
 # ── Background persistence loop ────────────────────────────────────
 
@@ -1136,7 +1069,7 @@ async def _persist_loop() -> None:
             if _CACHE_DIRTY and _ISSUES_CACHE is not None:
                 # Snapshot version before persisting
                 snapshot_version = _CACHE_VERSION
-                await asyncio.to_thread(_persist_to_disk, _ISSUES_CACHE[:])
+                await _blocking(_persist_to_disk, _ISSUES_CACHE[:])
                 # Only clear dirty if no new changes occurred during persist
                 if _CACHE_VERSION == snapshot_version:
                     _CACHE_DIRTY = False
@@ -1173,7 +1106,7 @@ async def _dispatch_loop() -> None:
         try:
             await asyncio.sleep(30)  # Check every 30 seconds
 
-            issues = await asyncio.to_thread(_read_all)
+            issues = await _blocking(_read_all)
             if not issues:
                 continue
 
@@ -1191,10 +1124,6 @@ async def _dispatch_loop() -> None:
             # For each agent with tasks, try to dispatch
             for agent_id, tasks in agent_tasks.items():
                 # Get cached ctx for this agent (populated by HTTP requests)
-                ctx = _LAST_CTX.get(agent_id)
-                if not ctx:
-                    # Skip if no ctx cached yet (wait for first HTTP request)
-                    continue
 
                 # Check if agent is idle (no running task for this agent)
                 agent_running = any(
@@ -1223,7 +1152,8 @@ async def _dispatch_loop() -> None:
                             candidate = task
                             break
 
-                if candidate:
+                ctx = _LAST_CTX.get(candidate["id"]) if candidate else None
+                if candidate and ctx:
                     # Dispatch the candidate
                     async with _txn():
                         issues_fresh = _read_all()
@@ -1266,8 +1196,7 @@ async def _dispatch_loop() -> None:
 # ── Lifecycle: startup and shutdown ────────────────────────────────
 
 
-@app.on_launch
-async def init_kanban():
+async def init_kanban(context):
     """Initialize kanban on app launch.
 
     1. Load issues from disk into memory cache
@@ -1275,67 +1204,52 @@ async def init_kanban():
     3. Start background persistence loop
     """
     global _ISSUES_CACHE, _DISPATCHER_TASK, _PERSIST_TASK
+    global _PLUGIN, _DATA_DIR, _DATA_FILE, _LOCK_FILE
+    _PLUGIN = context
+    legacy = _DATA_FILE
+    _DATA_FILE = context.storage.path("board/issues.json")
+    _DATA_DIR = _DATA_FILE.parent
+    _LOCK_FILE = _DATA_DIR / ".issues.lock"
+    importing = not _DATA_FILE.exists() and legacy.exists()
+    if importing:
+        data = await context.resources.run_sync(legacy.read_bytes)
+        await context.storage.awrite_bytes("board/issues.json", data)
+    context.resources.connection(_FinalFlush(), "Kanban final persistence")
 
-    # Load cache from disk
-    try:
-        _ISSUES_CACHE = await asyncio.to_thread(_load_from_disk)
-        logger.info(
-            "[kanban] Loaded %d issues from disk into cache",
-            len(_ISSUES_CACHE),
-        )
-    except Exception:  # noqa: BLE001
-        logger.exception("[kanban] Failed to load issues from disk")
-        _ISSUES_CACHE = []
+    _ISSUES_CACHE = await _blocking(_load_from_disk)
+    if importing:
+        for issue in _ISSUES_CACHE:
+            issue["legacy_session"] = True
+        _write_all(_ISSUES_CACHE)
+    logger.info("[kanban] Loaded %d issues", len(_ISSUES_CACHE))
 
     # Start dispatcher
     if _DISPATCHER_TASK is None or _DISPATCHER_TASK.done():
-        _DISPATCHER_TASK = asyncio.create_task(_dispatch_loop())
+        _DISPATCHER_TASK = context.resources.task(
+            _dispatch_loop(),
+            "Kanban dispatcher",
+        )
         logger.info("[kanban] Dispatcher task started")
 
     # Start persistence loop
     if _PERSIST_TASK is None or _PERSIST_TASK.done():
-        _PERSIST_TASK = asyncio.create_task(_persist_loop())
+        _PERSIST_TASK = context.resources.task(
+            _persist_loop(),
+            "Kanban persistence",
+        )
         logger.info("[kanban] Persistence task started")
 
 
-@app.on_terminate
-async def shutdown_kanban():
-    """Shutdown kanban on app terminate.
-
-    1. Stop background loops
-    2. Persist cache to disk (critical - ensure no data loss)
-    """
-    global _DISPATCHER_RUNNING, _PERSIST_RUNNING
-    global _DISPATCHER_TASK, _PERSIST_TASK
-
-    # Stop dispatcher
-    _DISPATCHER_RUNNING = False
-    if _DISPATCHER_TASK and not _DISPATCHER_TASK.done():
-        _DISPATCHER_TASK.cancel()
-        try:
-            await _DISPATCHER_TASK
-        except asyncio.CancelledError:
-            pass
-        logger.info("[kanban] Dispatcher task stopped")
-
-    # Stop persistence loop
-    _PERSIST_RUNNING = False
-    if _PERSIST_TASK and not _PERSIST_TASK.done():
-        _PERSIST_TASK.cancel()
-        try:
-            await _PERSIST_TASK
-        except asyncio.CancelledError:
-            pass
-        logger.info("[kanban] Persistence task stopped")
-
-    # Final persist (critical)
-    if _CACHE_DIRTY and _ISSUES_CACHE is not None:
-        try:
-            await asyncio.to_thread(_persist_to_disk, _ISSUES_CACHE[:])
-            logger.info("[kanban] Final cache persist completed")
-        except Exception:  # noqa: BLE001
-            logger.exception("[kanban] Failed to persist cache on shutdown")
+class _FinalFlush:
+    def close(self):
+        if _CACHE_DIRTY and _ISSUES_CACHE is not None:
+            _persist_to_disk(_ISSUES_CACHE[:])
 
 
-# The 'plugin' variable is what PluginLoader looks for.
-plugin = app
+class Plugin:
+    def register(self, context):
+        app.register(context)
+        context.on_activate(init_kanban)
+
+
+plugin = Plugin()
