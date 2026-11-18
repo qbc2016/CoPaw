@@ -1,0 +1,20 @@
+name: SDK migration candidate validation
+on:
+  push:
+    branches: [sdk-migration/teamchat]
+  workflow_dispatch:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    environment: maintainer-approved
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install host dependencies
+        run: python -m pip install -e '.[dev,test,full]'
+      - name: Run TeamChat production-flow acceptance
+        run: python -m pytest experiments/sdk/teamchat/tests/test_sdk_roundtable.py -q

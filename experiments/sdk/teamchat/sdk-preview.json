@@ -1,0 +1,10 @@
+{
+  "id": "team_chat",
+  "name": "TeamChat SDK core preview",
+  "version": "5.4.5",
+  "type": "app",
+  "entry": {"backend": "sdk_entry.py"},
+  "qwenpaw_version": {"min": "2.3.1"},
+  "sdk": {"version": "1.2.0", "capabilities": ["apps", "storage", "models", "resources"]},
+  "meta": {"permissions": {"chat": true, "storage": true}}
+}

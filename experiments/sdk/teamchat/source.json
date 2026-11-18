@@ -1,0 +1,16 @@
+{
+  "market_id": "@115886-cshu/team_chat",
+  "version": "5.4.5",
+  "download": "https://platform.agentscope.io/plugins/115886-cshu/team_chat/archive/zip/master",
+  "archive_sha256": "4e4d29928fc857475741c205804ed917776f2946f4385ec7e7ab5ad62e891063",
+  "sdk_base": "e06b695cc78a1adfe2303981b1320853a6765948",
+  "sample_scope": "production roundtable flow, scoped Agent calls, decision calls, configured model calls",
+  "not_migrated": [
+    "full HTTP router",
+    "synchronous group chat engine",
+    "email",
+    "browser extension",
+    "legacy data",
+    "frontend URLs"
+  ]
+}
