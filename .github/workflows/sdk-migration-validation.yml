@@ -1,0 +1,23 @@
+name: SDK migration candidate validation
+on:
+  push:
+    branches: [sdk-migration/creator]
+  workflow_dispatch:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    environment: maintainer-approved
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install host and Creator dependencies
+        run: |
+          python -m pip install -e '.[dev,test,full]'
+          python -m pip install oss2 imageio-ffmpeg pypdfium2 pandas matplotlib openpyxl tabulate numpy
+      - name: Run Creator lifecycle and host compatibility acceptance
+        working-directory: plugins/apps/qwenpaw-creator/backend
+        run: python -m pytest tests/api/test_sdk_host.py tests/api/test_plugin_host_error_contract.py -q

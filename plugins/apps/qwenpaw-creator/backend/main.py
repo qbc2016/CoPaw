@@ -86,6 +86,7 @@ from utils.logger import configure_creator_file_logging  # noqa: E402
 def configure_creator_runtime_environment(
     *,
     working_dir: Path | None = None,
+    data_root: Path | None = None,
 ) -> tuple[Path, Path]:
     """Provision Creator paths below QwenPaw's working directory by default.
 
@@ -94,17 +95,15 @@ def configure_creator_runtime_environment(
     inside the selected Creator data root.
     """
 
-    if working_dir is None:
-        from qwenpaw.constant import WORKING_DIR
-
-        working_dir = Path(WORKING_DIR)
-
     configured_root = os.environ.get("CREATOR_DATA_ROOT", "").strip()
-    data_root = (
-        Path(configured_root).expanduser()
-        if configured_root
-        else working_dir / "creator-runtime"
-    )
+    if data_root is None and configured_root:
+        data_root = Path(configured_root).expanduser()
+    if data_root is None:
+        if working_dir is None:
+            from qwenpaw.constant import WORKING_DIR
+
+            working_dir = Path(WORKING_DIR)
+        data_root = working_dir / "creator-runtime"
     if not data_root.is_absolute():
         raise CreatorDataRootError(
             "CREATOR_DATA_ROOT must be an absolute path",
@@ -156,7 +155,11 @@ app.include_router(creator_router)
 _file_services: CreatorFileServices | None = None
 
 
-async def _sweep_orphaned_scratch(services: CreatorFileServices) -> None:
+async def _sweep_orphaned_scratch(
+    services: CreatorFileServices,
+    *,
+    run_sync=asyncio.to_thread,
+) -> None:
     """Collect scratch a killed process left behind, without gating startup.
 
     A finished Task releases its own scratch through the execution store the
@@ -165,7 +168,7 @@ async def _sweep_orphaned_scratch(services: CreatorFileServices) -> None:
     """
 
     try:
-        sweep = await asyncio.to_thread(release_orphaned_scratch, services)
+        sweep = await run_sync(release_orphaned_scratch, services)
     except Exception:  # noqa: BLE001 - cleanup must never gate startup
         logger.warning("orphaned task scratch sweep failed", exc_info=True)
         return
@@ -180,10 +183,13 @@ async def _sweep_orphaned_scratch(services: CreatorFileServices) -> None:
 
 
 @app.hook("startup", priority=90)
-async def _startup() -> None:
+async def _startup(*, host=None) -> None:
     global _file_services
+    run_sync = host.run_sync if host is not None else asyncio.to_thread
     try:
-        configure_creator_runtime_environment()
+        configure_creator_runtime_environment(
+            data_root=host.data_root if host is not None else None,
+        )
         data_root = require_creator_data_root()
         log_path = configure_creator_file_logging(data_root)
         trace_event(
@@ -194,12 +200,12 @@ async def _startup() -> None:
                 "logPath": str(log_path),
             },
         )
-        dependency_status = await asyncio.to_thread(
+        dependency_status = await run_sync(
             ensure_creator_runtime_dependencies,
         )
-        await asyncio.to_thread(ensure_vendor_libs)
+        await run_sync(ensure_vendor_libs)
         services = creator_file_services(data_root)
-        await asyncio.to_thread(
+        await run_sync(
             recover_interrupted_source_analysis,
             services,
         )
@@ -225,11 +231,11 @@ async def _startup() -> None:
         # Observation/read workers live only in process memory: fail their
         # orphaned QUEUED/RUNNING Tasks closed so waiters see a retryable
         # error instead of polling a record no worker will ever finish.
-        await asyncio.to_thread(
+        await run_sync(
             recover_interrupted_source_observations,
             services,
         )
-        await asyncio.to_thread(
+        await run_sync(
             recover_interrupted_source_video_reads,
             services,
         )
@@ -253,7 +259,7 @@ async def _startup() -> None:
         raise
     _file_services = services
     logger.info("QwenPaw Creator file runtime ready at %s", data_root)
-    await _sweep_orphaned_scratch(services)
+    await _sweep_orphaned_scratch(services, run_sync=run_sync)
     # Loud, not silent: explicitly set review env vars take full control
     # and the settings-center toggles are ignored — a field incident had
     # review running with the UI switched off because a stale env stayed
