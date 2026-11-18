@@ -1,0 +1,635 @@
+diff --git a/README.md b/README.md
+index 5ab7720..723f8ff 100644
+--- a/README.md
++++ b/README.md
+@@ -578,4 +578,19 @@ team_chat/
+ 
+ ================================================================================
+   TeamChat v5.4.5  -  2026-10-10  -  0+1+2≠3 Team 115886
+-================================================================================
+\ No newline at end of file
++================================================================================
++## SDK 迁移试验（独立补丁，非完整升级版）
++
++基线是官方市场 TeamChat 5.4.5，下载包 SHA-256 为 `4e4d29928fc857475741c205804ed917776f2946f4385ec7e7ab5ad62e891063`。GitHub 当时公开版本为 5.3.6。宿主 SDK 基线为 PR #8764 的 `e06b695cc`。
++
++- [x] 从原 `/chat` 路由提取实际圆桌业务流程，旧入口与 SDK 候选复用同一函数。
++- [x] SDK 候选使用 `workspaces()`、`for_workspace()`、`chat()` 和 `models.complete()`，无需猜测端口或读取 ProviderManager/API key。
++- [x] 决策调用在明确的 Agent/会话作用域中清空并执行，调用超时由调用者控制。
++- [x] 圆桌记录放在 App 的调用者存储中，同名会谈不会共享不同用户的记录。
++- [x] 提供真实 PluginTestHost/Runtime 的远端 CI 回归用例，未在本地执行。
++- [ ] 迁移群聊的同步工作线程与整套路由、邮箱、浏览器扩展、原数据及 UI URL。
++- [ ] 验证取消期间的实际工具清理及真实模型服务。
++
++`python scripts/build_sdk_preview.py <新的空目录>` 只打包 SDK 核心候选；不会改动正式 `plugin.json`，也不会安装或启动。候选提供 `/api/team_chat/chat`、`/agents`、`/decision`、`/model`，不宣称保留完整 TeamChat UI。历史数据留在原插件中，迁移前不得把候选用于替换正式安装。
++
++本次复用真实圆桌流程证明了可迁移的代码结构，运行正确性仍待远端 CI。完整迁移的主要成本是现有 FastAPI 路由、调用者身份传递，以及群聊同步引擎的异步化，不应为 TeamChat 新建一个多 Agent 编排框架。
+diff --git a/roundtable.py b/roundtable.py
+new file mode 100644
+index 0000000..779ada6
+--- /dev/null
++++ b/roundtable.py
+@@ -0,0 +1,149 @@
++# -*- coding: utf-8 -*-
++"""TeamChat 5.4.5 roundtable behavior with an injected Agent transport."""
++
++import time
++import uuid
++from fastapi import HTTPException
++from fastapi.responses import JSONResponse
++
++MAX_HISTORY = 200
++
++
++def build_host_prompt(_message: str, history: list) -> str:
++    """Build a summary prompt for the host agent"""
++    parts = []
++    for h in history:
++        if h.get("role") == "human":
++            parts.append(f"[用户] {h.get('content', '')}")
++        elif h.get("role") == "agent":
++            parts.append(
++                f"[{h.get('sender_name', h.get('sender', '?'))}] "
++                f"{h.get('content', '')}",
++            )
++    context = "\n".join(parts)
++    return (
++        "你是团队主持人。以下是多智能体讨论的内容：\n\n"
++        f"{context}\n\n"
++        "请做一个简洁的总结（200字以内），指出各智能体的观点异同，并给出你的建议。"
++    )
++
++
++async def run_roundtable(req, *, store, agent_cache, call_agent):
++    agent_list = req.agent_ids
++    if not agent_list:
++        raise HTTPException(status_code=400, detail="至少需要一个参与智能体")
++
++    now = time.time()
++    new_sid = req.session_id or str(uuid.uuid4())
++
++    history = []
++    host_steps = []
++    existing = None
++    if req.session_id:
++        existing = store.get(req.session_id)
++        if existing:
++            history = existing.get("history", [])
++            host_steps = existing.get("host_steps", [])
++
++    if req.message.strip():
++        history.append(
++            {
++                "role": "human",
++                "sender": "human",
++                "sender_name": "人类用户",
++                "content": req.message,
++                "timestamp": now,
++            },
++        )
++
++    for aid in agent_list:
++        try:
++            agents = await agent_cache.get()
++            agent_info = next(
++                (a for a in agents if a.get("agent_id") == aid),
++                None,
++            )
++            agent_name = agent_info.get("name", aid) if agent_info else aid
++
++            resp_text = await call_agent(aid, req.message)
++            history.append(
++                {
++                    "role": "agent",
++                    "sender": aid,
++                    "sender_name": agent_name,
++                    "content": resp_text,
++                    "timestamp": time.time(),
++                },
++            )
++        except Exception as e:
++            history.append(
++                {
++                    "role": "agent",
++                    "sender": aid,
++                    "sender_name": aid,
++                    "content": f"[调用失败] {e}",
++                    "timestamp": time.time(),
++                },
++            )
++
++    host_prompt = build_host_prompt(req.message, history)
++    try:
++        host_resp = await call_agent(req.host_id, host_prompt)
++        host_steps.append(
++            {
++                "id": req.host_id,
++                "content": host_prompt,
++                "response": host_resp,
++                "time": time.time(),
++                "action": "主持人 " + req.host_name + " 汇总回复",
++                "detail": host_resp[:120] if host_resp else "",
++            },
++        )
++        history.append(
++            {
++                "role": "host",
++                "sender": req.host_id,
++                "sender_name": req.host_name,
++                "content": host_resp,
++                "timestamp": time.time(),
++            },
++        )
++    except Exception as e:
++        history.append(
++            {
++                "role": "host",
++                "sender": req.host_id,
++                "sender_name": req.host_id,
++                "content": f"[主持人调用失败] {e}",
++                "timestamp": time.time(),
++            },
++        )
++
++    if len(history) > MAX_HISTORY:
++        history = history[-MAX_HISTORY:]
++
++    data = {
++        "session_id": new_sid,
++        "host_id": req.host_id,
++        "host_name": req.host_name,
++        "agent_ids": agent_list,
++        "history": history,
++        "host_steps": host_steps,
++        "brainstorm": req.brainstorm,
++        "discussion_done": False,
++        "created_at": existing.get("created_at", now) if existing else now,
++        "updated_at": now,
++        "tag": req.session_id
++        and (store.get(req.session_id) or {}).get("tag", ""),
++        "pinned": req.session_id
++        and (store.get(req.session_id) or {}).get("pinned", False),
++    }
++    store.save(new_sid, data)
++
++    return JSONResponse(
++        content={
++            "session_id": new_sid,
++            "history": history,
++            "host_steps": host_steps,
++        },
++    )
+diff --git a/scripts/build_sdk_preview.py b/scripts/build_sdk_preview.py
+new file mode 100644
+index 0000000..57eceaf
+--- /dev/null
++++ b/scripts/build_sdk_preview.py
+@@ -0,0 +1,22 @@
++# -*- coding: utf-8 -*-
++"""Build the SDK core candidate without editing the release manifest."""
++
++import argparse
++from pathlib import Path
++import shutil
++
++
++def build(destination):
++    source = Path(__file__).resolve().parents[1]
++    destination = Path(destination)
++    destination.mkdir(parents=True, exist_ok=False)
++    for name in ("sdk_entry.py", "sdk_agents.py", "roundtable.py", "LICENSE"):
++        shutil.copyfile(source / name, destination / name)
++    shutil.copyfile(source / "sdk-preview.json", destination / "plugin.json")
++    return destination
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("destination", type=Path)
++    build(parser.parse_args().destination)
+diff --git a/sdk-preview.json b/sdk-preview.json
+new file mode 100644
+index 0000000..eacd0ae
+--- /dev/null
++++ b/sdk-preview.json
+@@ -0,0 +1,10 @@
++{
++  "id": "team_chat",
++  "name": "TeamChat SDK core preview",
++  "version": "5.4.5",
++  "type": "app",
++  "entry": {"backend": "sdk_entry.py"},
++  "qwenpaw_version": {"min": "2.3.1"},
++  "sdk": {"version": "1.2.0", "capabilities": ["apps", "storage", "models", "resources"]},
++  "meta": {"permissions": {"chat": true, "storage": true}}
++}
+diff --git a/sdk_agents.py b/sdk_agents.py
+new file mode 100644
+index 0000000..00b8852
+--- /dev/null
++++ b/sdk_agents.py
+@@ -0,0 +1,78 @@
++# -*- coding: utf-8 -*-
++"""Public SDK transport for TeamChat roundtables and decision workers."""
++
++import asyncio
++import hashlib
++import uuid
++
++from qwenpaw.plugins.apps import ChatRequest
++from qwenpaw.plugins.messages import ContentBlock, Message
++
++
++class AgentDirectory:
++    def __init__(self, call):
++        self.call = call
++
++    async def get(self):
++        return [
++            {"agent_id": row.id, "name": row.name, "enabled": row.enabled}
++            for row in await self.call.workspaces()
++            if row.enabled
++        ]
++
++
++class SessionStore:
++    def __init__(self, storage):
++        self.storage = storage
++
++    @staticmethod
++    def key(session_id):
++        digest = hashlib.sha256(session_id.encode()).hexdigest()
++        return "roundtables/" + digest + ".json"
++
++    def get(self, session_id):
++        return self.storage.read_json(self.key(session_id))
++
++    def save(self, session_id, value):
++        self.storage.write_json(self.key(session_id), value)
++
++
++class AgentCalls:
++    def __init__(self, call):
++        self.call = call
++
++    async def chat(self, agent_id, prompt, *, session_id=None, timeout=120):
++        async with asyncio.timeout(timeout):
++            async with self.call.for_workspace(agent_id) as target:
++                reply = await target.chat(
++                    ChatRequest(
++                        prompt,
++                        session_id=session_id
++                        or "teamchat:" + uuid.uuid4().hex,
++                    ),
++                )
++                if not reply.text.strip():
++                    raise ValueError("Agent returned no visible reply")
++                return reply.text
++
++    async def decide(self, agent_id, prompt, vote_id):
++        session_id = "decision:" + vote_id + ":" + agent_id
++        async with self.call.for_workspace(agent_id) as target:
++            async with asyncio.timeout(120):
++                await target.chat(ChatRequest("/clear", session_id=session_id))
++                return (
++                    await target.chat(
++                        ChatRequest(
++                            prompt,
++                            session_id=session_id,
++                        ),
++                    )
++                ).text
++
++    async def model(self, prompt):
++        reply = await self.call.models.complete(
++            (Message("user", (ContentBlock(text=prompt),)),),
++        )
++        return "".join(
++            block.text for block in reply.content if block.type == "text"
++        )
+diff --git a/sdk_entry.py b/sdk_entry.py
+new file mode 100644
+index 0000000..4973928
+--- /dev/null
++++ b/sdk_entry.py
+@@ -0,0 +1,87 @@
++# -*- coding: utf-8 -*-
++"""Opt-in SDK core routes; the full TeamChat release entry stays unchanged."""
++
++import asyncio
++import json
++import weakref
++
++from pydantic import BaseModel, Field, ValidationError
++
++from qwenpaw.plugins.apps import HttpResponse, PawApp
++
++# The host loads the entry as an isolated package.
++# pylint: disable=relative-beyond-top-level
++from .roundtable import run_roundtable
++from .sdk_agents import AgentCalls, AgentDirectory, SessionStore
++# pylint: enable=relative-beyond-top-level
++
++
++class RoundtableRequest(BaseModel):
++    message: str = ""
++    host_id: str = "cloud-orchestrator"
++    agent_ids: list[str] = Field(default_factory=list)
++    session_id: str = ""
++    host_name: str = "CloudPaw-Master"
++    brainstorm: bool = False
++
++
++app = PawApp("TeamChat SDK core preview", app_id="team_chat")
++_locks = weakref.WeakValueDictionary()
++
++
++@app.route("/agents")
++async def agents(call, _request):
++    return {"agents": await AgentDirectory(call).get()}
++
++
++@app.route("/chat", methods=("POST",))
++async def chat(call, request):
++    try:
++        payload = RoundtableRequest.model_validate(request.json())
++    except (ValidationError, json.JSONDecodeError) as exc:
++        return HttpResponse({"detail": str(exc)}, status=422)
++    key = (
++        call.workspace_id,
++        call.identity.user_id,
++        call.identity.channel,
++        payload.session_id,
++    )
++    lock = _locks.setdefault(key, asyncio.Lock())
++    async with lock:
++        result = await run_roundtable(
++            payload,
++            store=SessionStore(call.storage),
++            agent_cache=AgentDirectory(call),
++            call_agent=AgentCalls(call).chat,
++        )
++    return HttpResponse(json.loads(result.body), status=result.status_code)
++
++
++@app.route("/decision", methods=("POST",))
++async def decision(call, request):
++    body = request.json()
++    if not isinstance(body, dict) or not all(
++        isinstance(body.get(key), str) and body[key]
++        for key in ("agent_id", "prompt", "vote_id")
++    ):
++        return HttpResponse(
++            {"detail": "Agent, prompt and vote ID required"},
++            422,
++        )
++    text = await AgentCalls(call).decide(
++        body["agent_id"],
++        body["prompt"],
++        body["vote_id"],
++    )
++    return {"text": text}
++
++
++@app.route("/model", methods=("POST",))
++async def model(call, request):
++    body = request.json()
++    if not isinstance(body, dict) or not isinstance(body.get("prompt"), str):
++        return HttpResponse({"detail": "Prompt required"}, 422)
++    return {"text": await AgentCalls(call).model(body["prompt"])}
++
++
++plugin = app
+diff --git a/team_chat_main.py b/team_chat_main.py
+index 38734e0..3a56dc7 100644
+--- a/team_chat_main.py
++++ b/team_chat_main.py
+@@ -53,6 +53,8 @@ async def _run_in_thread(func, *args, **kwargs):
+     future = _EXECUTOR.submit(func, *args, **kwargs)
+     return await asyncio.wrap_future(future)
+ 
++from .roundtable import run_roundtable
++
+ logger = logging.getLogger("qwenpaw.team_chat")
+ 
+ # ── 尝试导入官方智能体管理工具 ──
+@@ -1442,110 +1444,10 @@ def build_router():
+ 
+     @router.post("/chat")
+     async def chat(req: ChatRequest):
+-        agent_list = req.agent_ids
+-        if not agent_list:
+-            raise HTTPException(status_code=400, detail="至少需要一个参与智能体")
+-
+-        now = time.time()
+-        new_sid = req.session_id or str(uuid.uuid4())
+-
+-        history = []
+-        host_steps = []
+-        existing = None
+-        if req.session_id:
+-            existing = store.get(req.session_id)
+-            if existing:
+-                history = existing.get("history", [])
+-                host_steps = existing.get("host_steps", [])
+-
+-        # 用户消息
+-        if req.message.strip():
+-            history.append({
+-                "role": "human",
+-                "sender": "human",
+-                "sender_name": "人类用户",
+-                "content": req.message,
+-                "timestamp": now,
+-            })
+-
+-        # 调用所有参与智能体
+-        for aid in agent_list:
+-            try:
+-                agents = await _agent_cache.get()
+-                agent_info = next((a for a in agents if a.get("agent_id") == aid), None)
+-                agent_name = agent_info.get("name", aid) if agent_info else aid
+-
+-                resp_text = await _call_agent_async(aid, req.message)
+-                history.append({
+-                    "role": "agent",
+-                    "sender": aid,
+-                    "sender_name": agent_name,
+-                    "content": resp_text,
+-                    "timestamp": time.time(),
+-                })
+-            except Exception as e:
+-                history.append({
+-                    "role": "agent",
+-                    "sender": aid,
+-                    "sender_name": aid,
+-                    "content": f"[调用失败] {e}",
+-                    "timestamp": time.time(),
+-                })
+-
+-        # 主持人总结
+-        host_prompt = _build_host_prompt(req.message, history)
+-        try:
+-            host_resp = await _call_agent_async(req.host_id, host_prompt)
+-            host_steps.append({
+-                "id": req.host_id,
+-                "content": host_prompt,
+-                "response": host_resp,
+-                "time": time.time(),
+-                "action": "主持人 "+req.host_name+" 汇总回复",
+-                "detail": host_resp[:120] if host_resp else "",
+-            })
+-            history.append({
+-                "role": "host",
+-                "sender": req.host_id,
+-                "sender_name": req.host_name,
+-                "content": host_resp,
+-                "timestamp": time.time(),
+-            })
+-        except Exception as e:
+-            history.append({
+-                "role": "host",
+-                "sender": req.host_id,
+-                "sender_name": req.host_id,
+-                "content": f"[主持人调用失败] {e}",
+-                "timestamp": time.time(),
+-            })
+-
+-        # 截断历史
+-        if len(history) > MAX_HISTORY:
+-            history = history[-MAX_HISTORY:]
+-
+-        # 保存
+-        data = {
+-            "session_id": new_sid,
+-            "host_id": req.host_id,
+-            "host_name": req.host_name,
+-            "agent_ids": agent_list,
+-            "history": history,
+-            "host_steps": host_steps,
+-            "brainstorm": req.brainstorm,
+-            "discussion_done": False,
+-            "created_at": existing.get("created_at", now) if existing else now,
+-            "updated_at": now,
+-            "tag": req.session_id and (store.get(req.session_id) or {}).get("tag", ""),
+-            "pinned": req.session_id and (store.get(req.session_id) or {}).get("pinned", False),
+-        }
+-        store.save(new_sid, data)
+-
+-        return JSONResponse(content={
+-            "session_id": new_sid,
+-            "history": history,
+-            "host_steps": host_steps,
+-        })
++        return await run_roundtable(
++            req, store=store, agent_cache=_agent_cache,
++            call_agent=_call_agent_async,
++        )
+ 
+     # ---- 远程直聊（原创作者AI → 云服务器 CloudPaw-Master） ----
+ 
+diff --git a/tests/test_sdk_roundtable.py b/tests/test_sdk_roundtable.py
+new file mode 100644
+index 0000000..88a1cd3
+--- /dev/null
++++ b/tests/test_sdk_roundtable.py
+@@ -0,0 +1,99 @@
++# -*- coding: utf-8 -*-
++"""Remote-CI acceptance for the extracted production roundtable."""
++
++import json
++from pathlib import Path
++import shutil
++
++import pytest
++
++from qwenpaw.plugins.testing import PluginTestHost
++
++ROOT = Path(__file__).resolve().parents[1]
++pytestmark = pytest.mark.asyncio
++PROVIDER = """
++from qwenpaw.plugins.providers import ProviderSpec, ModelInfo, ModelChunk
++from qwenpaw.plugins.messages import ContentBlock
++class Plugin:
++    def register(self, ctx):
++        async def generate(call, request):
++            yield ModelChunk((ContentBlock(
++                text="answer-" + call.identity.workspace_id),), is_last=True)
++        ctx.register_provider(ProviderSpec(
++            "teamchat-model", "Model", generate,
++            models=(ModelInfo("model", "Model"),), require_api_key=False))
++plugin = Plugin()
++"""
++
++
++def package(tmp_path):
++    target = tmp_path / "candidate"
++    target.mkdir()
++    for name in ("sdk_entry.py", "sdk_agents.py", "roundtable.py"):
++        shutil.copyfile(ROOT / name, target / name)
++    shutil.copyfile(ROOT / "sdk-preview.json", target / "plugin.json")
++    return target
++
++
++async def test_real_roundtable_preserves_flow_and_isolates_history(tmp_path):
++    source = package(tmp_path)
++    provider = tmp_path / "provider"
++    provider.mkdir()
++    (provider / "main.py").write_text(PROVIDER, encoding="utf-8")
++    (provider / "plugin.json").write_text(
++        json.dumps(
++            {
++                "id": "teamchat-model",
++                "version": "1.0.0",
++                "entry": {"backend": "main.py"},
++                "sdk": {"version": "1.2.0", "capabilities": ["providers"]},
++            },
++        ),
++        encoding="utf-8",
++    )
++    async with PluginTestHost(tmp_path / "host") as host:
++        await host.load(provider)
++        for workspace in ("test", "other"):
++            await host.configure_chat_model(
++                "teamchat-model",
++                "model",
++                workspace_id=workspace,
++            )
++        await host.load(source)
++        payload = {
++            "message": "Discuss",
++            "agent_ids": ["test"],
++            "host_id": "other",
++            "session_id": "same-session",
++        }
++        for user, count in (("alice", 3), ("bob", 3), ("alice", 6)):
++            result = await host.request(
++                "POST",
++                "/api/team_chat/chat",
++                json=payload,
++                user_id=user,
++            )
++            assert result.status == 200
++            history = result.json()["history"]
++            assert len(history) == count
++            assert [
++                (row["role"], row["sender"], row["content"])
++                for row in history[-3:]
++            ] == [
++                ("human", "human", "Discuss"),
++                ("agent", "test", "answer-test"),
++                ("host", "other", "answer-other"),
++            ]
++        result = await host.request(
++            "POST",
++            "/api/team_chat/model",
++            json={"prompt": "Hello"},
++        )
++        assert result.json() == {"text": "answer-test"}
++        result = await host.request(
++            "POST",
++            "/api/team_chat/decision",
++            json={"agent_id": "other", "vote_id": "one", "prompt": "Vote"},
++        )
++        assert result.json() == {"text": "answer-other"}
++        assert (await host.uninstall("team_chat")).clean

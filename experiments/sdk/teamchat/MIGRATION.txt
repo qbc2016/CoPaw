@@ -1,0 +1,16 @@
+TeamChat 5.4.5 SDK 核心迁移候选
+
+本目录用于独立审查和远端 CI，不是官方插件，也不属于 SDK PR #8764。
+补丁基于市场版 5.4.5，出处、下载包指纹及 SDK 基线见 source.json。
+补丁提取原圆桌流程，使旧入口与 SDK 入口共用相同业务函数。
+SDK 候选不读取宿主配置或 ProviderManager，不通过本机端口绕行调用 Agent。
+会谈记录由 App 存储按调用者隔离，Agent 调用进入 for_workspace 作用域。
+
+打包：python scripts/build_sdk_preview.py <不存在的输出目录>
+产物仅覆盖 /api/team_chat/chat、agents、decision、model。
+正式 TeamChat 清单仍保留旧入口；此候选不包含原完整 UI。
+
+未完成：原 HTTP 路由与 URL 兼容、同步群聊引擎、邮箱、浏览器扩展、旧数据迁移。
+候选不能替换完整安装。公开 SDK 的多 Agent 调用能力有可行的代码映射，
+完整迁移是否保持行为仍需远端回归和上述剩余路径验证。
+不应据此新增一个通用多 Agent 编排框架。
