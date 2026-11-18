@@ -1,0 +1,20 @@
+name: SDK migration candidate validation
+on:
+  push:
+    branches: [sdk-migration/agent-kanban]
+  workflow_dispatch:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    environment: maintainer-approved
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install host dependencies
+        run: python -m pip install -e '.[dev,test,full]'
+      - name: Run Kanban migration acceptance
+        run: python -m pytest tests/unit/plugins/test_sdk_kanban_migration.py -q
