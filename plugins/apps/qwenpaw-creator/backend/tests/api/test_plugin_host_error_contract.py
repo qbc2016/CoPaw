@@ -147,3 +147,21 @@ def test_real_qwenpaw_host_mount_keeps_creator_errors_local_and_structured(
         assert body["requestId"] == response.headers["X-Request-ID"]
     finally:
         PluginRegistry._instance = previous_registry
+
+
+def test_sdk_selected_data_root_preserves_existing_project_files(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CREATOR_DATA_ROOT", str(tmp_path / "environment-root"))
+    monkeypatch.setenv("CREATOR_MODEL_CONFIG_PATH", "")
+    monkeypatch.setenv("CREATOR_BINARY_DIR", "")
+    module = _load_plugin_entrypoint(monkeypatch)
+    selected = tmp_path / "existing-creator"
+    selected.mkdir()
+    project = selected / "project.json"
+    project.write_text('{"title": "existing"}', encoding="utf-8")
+    paths = module.configure_creator_runtime_environment(data_root=selected)
+    assert paths == (selected, selected / "config" / "model_config.json")
+    assert project.read_text(encoding="utf-8") == '{"title": "existing"}'
+    assert not (tmp_path / "environment-root").exists()

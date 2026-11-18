@@ -1,0 +1,30 @@
+{
+  "id": "qwenpaw-creator",
+  "name": "Creator SDK lifecycle preview",
+  "version": "2.0.6",
+  "type": "app",
+  "entry": {
+    "backend": "backend/sdk_entry.py"
+  },
+  "dependencies": [
+    "oss2",
+    "imageio-ffmpeg",
+    "pypdfium2",
+    "pandas",
+    "matplotlib",
+    "openpyxl",
+    "tabulate",
+    "numpy"
+  ],
+  "qwenpaw_version": {
+    "min": "2.3.1"
+  },
+  "sdk": {
+    "version": "1.2.0",
+    "capabilities": [
+      "config",
+      "resources",
+      "storage"
+    ]
+  }
+}

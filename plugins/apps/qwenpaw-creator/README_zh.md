@@ -187,3 +187,20 @@ Agent 每次请求模型前会先量一次输入，超限时先压缩历史、�
 - `CREATOR_CONTINUATION_SUMMARY_ENABLED`：设为 `0` 跳过在归档 seq 召回地图旁读取的接续摘要（额外一次模型调用）；仅靠召回地图已能保证不丢内容。默认开启。
 
 已知边界：以 URL 形式进入请求的媒体（DashScope 临时 OSS、公网素材地址）不计入这份预算，也无法被降级——它们在线只占几百字节，但 provider 仍按视觉 token 计费。使用这类传输的部署请确认解析出的窗口能覆盖该模型，目录未覆盖时再显式声明 `CREATOR_MODEL_CONTEXT_TOKENS`。
+
+## SDK 迁移试验：生命周期边界（不属于 SDK PR）
+
+基线：Creator 2.0.6 / SDK PR #8764 `e06b695cc`。正式清单仍使用原入口；`sdk-preview.json` 仅用于独立试验目录，不可作为完整 Creator 升级包。
+
+- [x] 现有 `_startup()` 可接收 SDK 宿主边界，复用相同的媒体恢复、运行时启动与清理流程。
+- [x] SDK 路径将启动时的阻塞工作登记到资源作用域，在启动前登记关闭回调，覆盖部分启动失败。
+- [x] 数据根目录由显式插件配置 `data_root` 提供，不再从宿主常量猜测；正式入口默认行为保持不变。
+- [ ] 现有 FastAPI APIRouter、dependencies、Request/Form/File 和响应处理迁入公共路由。
+- [ ] 读取/更新原 `creator_*` 命名工具配置及加密配置文件的兼容方案。
+- [ ] 内部 Agent/媒体服务创建的任务、线程和进程逐层登记，而非仅登记总关闭回调。
+- [ ] Skills Hub 下载、浏览器/桌面宿主服务与旧数据目录迁移。
+- [ ] 远端回归测试及真实媒体服务验收；本地没有运行单测。
+
+此试验不能证明 Creator 已完全兼容公共 SDK。当前缺口不应通过公开 Registry、ProviderManager、secret store 或浏览器内部对象解决。优先讨论：是否支持现有 ASGI 应用的受控挂载，以及如何向插件提供其自身已声明配置组的调用级快照。SDK 配置更新与旧密钥迁移需另行明确契约，不能把旧字段清空后要求用户重新填写。
+
+生命周期候选要求明确指定已有 Creator 数据目录，缺失时直接失败。正式入口仍保留原来的 `CREATOR_DATA_ROOT` 与 `WORKING_DIR/creator-runtime` 解析行为，未搬移或删除数据。
